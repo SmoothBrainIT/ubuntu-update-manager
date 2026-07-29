@@ -5,6 +5,57 @@ All notable changes to Ubuntu Update Manager are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.1.1 - 2026-07-29
+
+### Added
+
+- `doctor` (also available as `check`) to validate required utilities, managed
+  file ownership and permissions, configuration and cron parsing, cron service
+  state, reboot prerequisites, Snap availability, and optional mail delivery.
+- `preview` (also available as `dry-run`) to show pending APT and Snap updates
+  without changing the system or refreshing package lists.
+- `export-config` for validated, noninteractive configuration backups and
+  audits.
+- `check-update` and an interactive-menu prompt when the public repository has
+  a newer semantic version.
+- `self-update` and `set-self-update off|manual|scheduled|both` for validated,
+  atomic manager updates before selected package-update runs.
+- `/usr/local/sbin/uum` as a short command for every existing subcommand, with
+  collision-aware installation, health checks, and uninstall cleanup.
+- `set-lock-timeout SECONDS` and the `APT_LOCK_TIMEOUT` setting, accepting 0
+  through 3600 seconds with the existing conservative 300-second default.
+- Explicit checks for required base utilities before installation and update
+  execution.
+- Automated Bash syntax checks, ShellCheck, and CLI smoke tests through GitHub
+  Actions.
+- Support, contribution, and security policies.
+
+### Changed
+
+- Failure output, system-log entries, email notifications, and persistent state
+  now identify the exact failed update phase.
+- Persistent run state now records whether the last run required a reboot and
+  whether a reboot was scheduled.
+- Status output now includes the configured APT lock timeout and last-run reboot
+  details.
+- The support target is documented as Ubuntu 22.04, 24.04, and 26.04 LTS while
+  those releases remain in Canonical's standard support window.
+
+### Compatibility
+
+- Existing 1.1.0 configuration files migrate automatically; the new lock
+  timeout uses 300 seconds and automatic manager updates remain off when the
+  corresponding keys are absent.
+- Menu checks remain enabled when automatic manager updates are off. A failed
+  check or self-update never blocks Ubuntu package updates.
+- The `uum` shorthand intentionally takes precedence in the administrator
+  `PATH`. Installation refuses to overwrite an unrelated local `uum` path, and
+  the full `ubuntu-update-manager` command remains available.
+
+### Fixed
+
+- Corrected the README license section to reflect the repository's MIT license.
+
 ## 1.1.0 - 2026-07-28
 
 ### Added

@@ -14,8 +14,11 @@
 set -Eeuo pipefail
 
 PROGRAM_NAME="ubuntu-update-manager"
-PROGRAM_VERSION="1.1.0"
+PROGRAM_VERSION="1.1.1"
+UPDATE_SOURCE_URL="https://raw.githubusercontent.com/SmoothBrainIT/ubuntu-update-manager/main/ubuntu-update-manager.sh"
 INSTALL_PATH="/usr/local/sbin/${PROGRAM_NAME}"
+SHORT_COMMAND="uum"
+SHORT_INSTALL_PATH="/usr/local/sbin/${SHORT_COMMAND}"
 CONFIG_PATH="/etc/default/${PROGRAM_NAME}"
 CRON_PATH="/etc/cron.d/${PROGRAM_NAME}"
 LOG_PATH="/var/log/${PROGRAM_NAME}.log"
@@ -35,6 +38,8 @@ DEFAULT_UPDATE_MODE="safe"
 DEFAULT_AUTO_REBOOT="no"
 DEFAULT_INCLUDE_SNAPS="yes"
 DEFAULT_NOTIFY_EMAIL=""
+DEFAULT_APT_LOCK_TIMEOUT="300"
+DEFAULT_SELF_UPDATE_MODE="off"
 
 ENABLED="$DEFAULT_ENABLED"
 FREQUENCY="$DEFAULT_FREQUENCY"
@@ -45,6 +50,12 @@ UPDATE_MODE="$DEFAULT_UPDATE_MODE"
 AUTO_REBOOT="$DEFAULT_AUTO_REBOOT"
 INCLUDE_SNAPS="$DEFAULT_INCLUDE_SNAPS"
 NOTIFY_EMAIL="$DEFAULT_NOTIFY_EMAIL"
+APT_LOCK_TIMEOUT="$DEFAULT_APT_LOCK_TIMEOUT"
+SELF_UPDATE_MODE="$DEFAULT_SELF_UPDATE_MODE"
+
+UPDATE_PHASE="initialization"
+REBOOT_REQUIRED="unknown"
+REBOOT_SCHEDULED="no"
 
 usage() {
     cat <<'EOF'
@@ -52,6 +63,7 @@ Ubuntu Update Manager
 
 Usage:
   ubuntu-update-manager <command> [options]
+  uum <command> [options]
 
 Commands:
   install
@@ -62,6 +74,21 @@ Commands:
 
   disable
       Disable scheduled updates without removing the manager.
+
+  preview
+      Report pending APT and Snap updates without changing the system.
+
+  doctor
+      Validate the installation, configuration, and required services.
+
+  export-config
+      Print the validated configuration for backups and audits.
+
+  check-update
+      Check the public repository for a newer manager version.
+
+  self-update
+      Download, validate, and install a newer manager version.
 
   status
       Show the current configuration and cron service status.
@@ -95,6 +122,12 @@ Commands:
   set-reboot on|off
       Enable or disable automatic rebooting when updates require it.
       Automatic rebooting is disabled by default.
+
+  set-lock-timeout SECONDS
+      Set the APT/dpkg lock wait from 0 through 3600 seconds.
+
+  set-self-update off|manual|scheduled|both
+      Choose which update runs automatically update the manager itself.
 
   set-snaps on|off
       Enable or disable Snap refreshes during scheduled update runs.
@@ -143,6 +176,32 @@ require_root() {
     fi
 }
 
+missing_required_utilities() {
+    local utility
+    local -a required=(
+        apt-get chmod chown date dirname flock getent hostname install ln logger
+        mktemp mv pgrep ps readlink rm rmdir stat tail tee touch
+    )
+
+    for utility in "${required[@]}"; do
+        command -v "$utility" >/dev/null 2>&1 || printf '%s\n' "$utility"
+    done
+}
+
+check_required_utilities() {
+    local -a missing=()
+
+    mapfile -t missing < <(missing_required_utilities)
+    if (( ${#missing[@]} > 0 )); then
+        die "Missing required base utilities: ${missing[*]}"
+    fi
+
+    if [[ "$AUTO_REBOOT" == "yes" ]] &&
+        ! command -v shutdown >/dev/null 2>&1; then
+        die "Automatic rebooting requires the shutdown utility."
+    fi
+}
+
 normalize_on_off() {
     case "${1,,}" in
         on|yes|true|1|enabled)
@@ -167,6 +226,8 @@ set_config_defaults() {
     AUTO_REBOOT="$DEFAULT_AUTO_REBOOT"
     INCLUDE_SNAPS="$DEFAULT_INCLUDE_SNAPS"
     NOTIFY_EMAIL="$DEFAULT_NOTIFY_EMAIL"
+    APT_LOCK_TIMEOUT="$DEFAULT_APT_LOCK_TIMEOUT"
+    SELF_UPDATE_MODE="$DEFAULT_SELF_UPDATE_MODE"
 }
 
 decode_legacy_config_value() {
@@ -183,7 +244,7 @@ decode_legacy_config_value() {
         if [[ "$escaped" == "yes" ]]; then
             decoded+="$character"
             escaped="no"
-        elif [[ "$character" == '\' ]]; then
+        elif [[ "$character" == "\\" ]]; then
             escaped="yes"
         else
             decoded+="$character"
@@ -319,16 +380,19 @@ validate_config_values() {
             expected_expression="${minute} ${hour} * * ${RUN_DAY}"
             ;;
         monthly)
-            [[ "$RUN_DAY" =~ ^[0-9]+$ ]] &&
-                (( 10#$RUN_DAY >= 1 && 10#$RUN_DAY <= 28 )) ||
+            if [[ ! "$RUN_DAY" =~ ^[0-9]+$ ]] ||
+                (( 10#$RUN_DAY < 1 || 10#$RUN_DAY > 28 )); then
                 die "RUN_DAY must be 1 through 28 for a monthly schedule."
+            fi
             expected_expression="${minute} ${hour} $((10#$RUN_DAY)) * *"
             ;;
         custom)
-            [[ "$RUN_DAY" == "*" ||
-                ( "$RUN_DAY" =~ ^[0-9]{1,2}$ &&
-                10#$RUN_DAY -ge 0 && 10#$RUN_DAY -le 28 ) ]] ||
-                die "Invalid retained RUN_DAY in ${CONFIG_PATH}."
+            if [[ "$RUN_DAY" != "*" ]]; then
+                if [[ ! "$RUN_DAY" =~ ^[0-9]{1,2}$ ]] ||
+                    (( 10#$RUN_DAY > 28 )); then
+                    die "Invalid retained RUN_DAY in ${CONFIG_PATH}."
+                fi
+            fi
             ;;
     esac
 
@@ -344,6 +408,14 @@ validate_config_values() {
     [[ "$INCLUDE_SNAPS" == "yes" || "$INCLUDE_SNAPS" == "no" ]] ||
         die "Invalid INCLUDE_SNAPS value in ${CONFIG_PATH}."
     validate_email "$NOTIFY_EMAIL"
+    if [[ ! "$APT_LOCK_TIMEOUT" =~ ^[0-9]+$ ]] ||
+        (( ${#APT_LOCK_TIMEOUT} > 4 || 10#$APT_LOCK_TIMEOUT > 3600 )); then
+        die "APT_LOCK_TIMEOUT must be a number from 0 through 3600."
+    fi
+    case "$SELF_UPDATE_MODE" in
+        off|manual|scheduled|both) ;;
+        *) die "SELF_UPDATE_MODE must be off, manual, scheduled, or both." ;;
+    esac
 }
 
 check_config_file_security() {
@@ -394,6 +466,8 @@ load_config() {
             AUTO_REBOOT) AUTO_REBOOT="$value" ;;
             INCLUDE_SNAPS) INCLUDE_SNAPS="$value" ;;
             NOTIFY_EMAIL) NOTIFY_EMAIL="$value" ;;
+            APT_LOCK_TIMEOUT) APT_LOCK_TIMEOUT="$value" ;;
+            SELF_UPDATE_MODE) SELF_UPDATE_MODE="$value" ;;
             *) die "Unknown configuration key ${key} in ${CONFIG_PATH}." ;;
         esac
     done <"$CONFIG_PATH"
@@ -424,6 +498,8 @@ write_config() (
         printf 'AUTO_REBOOT=%s\n' "$AUTO_REBOOT"
         printf 'INCLUDE_SNAPS=%s\n' "$INCLUDE_SNAPS"
         printf 'NOTIFY_EMAIL=%s\n' "$NOTIFY_EMAIL"
+        printf 'APT_LOCK_TIMEOUT=%s\n' "$APT_LOCK_TIMEOUT"
+        printf 'SELF_UPDATE_MODE=%s\n' "$SELF_UPDATE_MODE"
     } >"$temp_file"
 
     chown root:root "$temp_file"
@@ -514,7 +590,11 @@ write_run_state() (
     local started_at="$3"
     local finished_at="$4"
     local duration="$5"
+    local failed_phase="${6:-}"
+    local reboot_required="${7:-unknown}"
+    local reboot_scheduled="${8:-no}"
     local temp_file previous_success="" previous_failure=""
+    local previous_failed_phase=""
     local line key value
 
     require_root
@@ -528,6 +608,7 @@ write_run_state() (
             case "$key" in
                 LAST_SUCCESS_AT) previous_success="$value" ;;
                 LAST_FAILURE_AT) previous_failure="$value" ;;
+                LAST_FAILED_PHASE) previous_failed_phase="$value" ;;
             esac
         done <"$STATE_PATH"
     fi
@@ -536,6 +617,7 @@ write_run_state() (
         previous_success="$finished_at"
     else
         previous_failure="$finished_at"
+        previous_failed_phase="$failed_phase"
     fi
 
     [[ ! -L "$STATE_PATH" ]] ||
@@ -551,6 +633,9 @@ write_run_state() (
         printf 'LAST_DURATION_SECONDS=%s\n' "$duration"
         printf 'LAST_SUCCESS_AT=%s\n' "$previous_success"
         printf 'LAST_FAILURE_AT=%s\n' "$previous_failure"
+        printf 'LAST_FAILED_PHASE=%s\n' "$previous_failed_phase"
+        printf 'LAST_REBOOT_REQUIRED=%s\n' "$reboot_required"
+        printf 'LAST_REBOOT_SCHEDULED=%s\n' "$reboot_scheduled"
     } >"$temp_file"
 
     chown root:root "$temp_file"
@@ -567,6 +652,9 @@ show_run_state() {
     local last_duration="n/a"
     local last_success="never"
     local last_failure="never"
+    local last_failed_phase="n/a"
+    local last_reboot_required="unknown"
+    local last_reboot_scheduled="no"
     local line key value
 
     if [[ -r "$STATE_PATH" && -f "$STATE_PATH" && ! -L "$STATE_PATH" ]]; then
@@ -582,6 +670,9 @@ show_run_state() {
                 LAST_DURATION_SECONDS) last_duration="${value:-n/a}" ;;
                 LAST_SUCCESS_AT) last_success="${value:-never}" ;;
                 LAST_FAILURE_AT) last_failure="${value:-never}" ;;
+                LAST_FAILED_PHASE) last_failed_phase="${value:-n/a}" ;;
+                LAST_REBOOT_REQUIRED) last_reboot_required="${value:-unknown}" ;;
+                LAST_REBOOT_SCHEDULED) last_reboot_scheduled="${value:-no}" ;;
             esac
         done <"$STATE_PATH"
     fi
@@ -590,6 +681,11 @@ show_run_state() {
     info "Last result:      ${last_result} (exit ${last_exit}, ${last_duration}s)"
     info "Last success:     ${last_success}"
     info "Last failure:     ${last_failure}"
+    if [[ "$last_failed_phase" != "n/a" ]]; then
+        info "Last failed phase: ${last_failed_phase}"
+    fi
+    info "Reboot required:  ${last_reboot_required}"
+    info "Reboot scheduled: ${last_reboot_scheduled}"
     if [[ "$last_finished" != "never" ]]; then
         info "Last finished:    ${last_finished}"
     fi
@@ -660,13 +756,13 @@ ensure_cron_service() {
         info "Installing required packages: ${packages[*]}"
         export DEBIAN_FRONTEND=noninteractive
         apt-get \
-            -o DPkg::Lock::Timeout=300 \
+            -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" \
             -o Acquire::Retries=3 \
             -o APT::Update::Error-Mode=any \
             update
         apt-get \
             -y \
-            -o DPkg::Lock::Timeout=300 \
+            -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" \
             -o Acquire::Retries=3 \
             install "${packages[@]}"
     fi
@@ -704,6 +800,267 @@ install_program_file() (
     trap - EXIT
 )
 
+short_command_installed() {
+    [[ -L "$SHORT_INSTALL_PATH" ]] &&
+        [[ "$(readlink -f -- "$SHORT_INSTALL_PATH" 2>/dev/null)" == "$(readlink -f -- "$INSTALL_PATH" 2>/dev/null)" ]]
+}
+
+check_short_command_destination() {
+    if [[ -L "$SHORT_INSTALL_PATH" ]]; then
+        if short_command_installed; then
+            return
+        fi
+        die "Refusing to replace unrelated symbolic link ${SHORT_INSTALL_PATH}."
+    fi
+    [[ ! -e "$SHORT_INSTALL_PATH" ]] ||
+        die "Refusing to replace existing path ${SHORT_INSTALL_PATH}."
+}
+
+install_short_command() (
+    require_root
+
+    local existing_command=""
+
+    if [[ -L "$SHORT_INSTALL_PATH" ]]; then
+        if short_command_installed; then
+            return
+        fi
+        die "Refusing to replace unrelated symbolic link ${SHORT_INSTALL_PATH}."
+    fi
+    [[ ! -e "$SHORT_INSTALL_PATH" ]] ||
+        die "Refusing to replace existing path ${SHORT_INSTALL_PATH}."
+
+    existing_command="$(command -v "$SHORT_COMMAND" 2>/dev/null || true)"
+    if [[ -n "$existing_command" && "$existing_command" != "$SHORT_INSTALL_PATH" ]]; then
+        warn "Installing ${SHORT_INSTALL_PATH}; it will take precedence over ${existing_command} for administrators."
+    fi
+
+    ln -s -- "$INSTALL_PATH" "$SHORT_INSTALL_PATH"
+)
+
+download_update_source() {
+    local destination="$1"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --silent --show-error --location \
+            --connect-timeout 5 --max-time 15 \
+            --proto '=https' --proto-redir '=https' \
+            --output "$destination" "$UPDATE_SOURCE_URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --quiet --https-only --timeout=15 --tries=1 \
+            --output-document="$destination" "$UPDATE_SOURCE_URL"
+    else
+        warn "Update checks require curl or wget."
+        return 1
+    fi
+}
+
+script_version() {
+    local script_file="$1"
+    local line version="" matches=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^PROGRAM_VERSION=\"([0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9})\"$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            ((matches += 1))
+        fi
+    done <"$script_file"
+
+    (( matches == 1 )) || return 1
+    printf '%s\n' "$version"
+}
+
+script_identifies_manager() {
+    local script_file="$1"
+    local line matches=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == 'PROGRAM_NAME="ubuntu-update-manager"' ]]; then
+            ((matches += 1))
+        fi
+    done <"$script_file"
+
+    (( matches == 1 ))
+}
+
+version_is_newer() {
+    local candidate="$1"
+    local current="$2"
+    local index candidate_number current_number
+    local -a candidate_parts current_parts
+
+    [[ "$candidate" =~ ^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$ ]] || return 1
+    [[ "$current" =~ ^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$ ]] || return 1
+    IFS='.' read -r -a candidate_parts <<<"$candidate"
+    IFS='.' read -r -a current_parts <<<"$current"
+
+    for index in 0 1 2; do
+        candidate_number="$((10#${candidate_parts[$index]}))"
+        current_number="$((10#${current_parts[$index]}))"
+        if (( candidate_number > current_number )); then
+            return 0
+        fi
+        if (( candidate_number < current_number )); then
+            return 1
+        fi
+    done
+    return 1
+}
+
+validate_update_candidate() {
+    local candidate="$1"
+    local expected_version="$2"
+    local candidate_version first_line size
+
+    size="$(stat -c '%s' "$candidate" 2>/dev/null)" || return 1
+    (( size > 0 && size <= 1048576 )) || return 1
+    IFS= read -r first_line <"$candidate" || return 1
+    [[ "$first_line" == '#!/usr/bin/env bash' ]] || return 1
+    script_identifies_manager "$candidate" || return 1
+    candidate_version="$(script_version "$candidate")" || return 1
+    [[ "$candidate_version" == "$expected_version" ]] || return 1
+    bash -n "$candidate"
+}
+
+latest_public_version() (
+    local candidate latest
+
+    candidate="$(mktemp)"
+    trap 'rm -f -- "$candidate"' EXIT
+    download_update_source "$candidate" || return 1
+    latest="$(script_version "$candidate")" || {
+        warn "The public update source did not contain one valid version declaration."
+        return 1
+    }
+    validate_update_candidate "$candidate" "$latest" || {
+        warn "The public update source failed validation."
+        return 1
+    }
+    printf '%s\n' "$latest"
+)
+
+check_for_manager_update() {
+    local latest
+
+    latest="$(latest_public_version)" || return 1
+    if version_is_newer "$latest" "$PROGRAM_VERSION"; then
+        info "Ubuntu Update Manager ${latest} is available (installed: ${PROGRAM_VERSION})."
+    elif [[ "$latest" == "$PROGRAM_VERSION" ]]; then
+        info "Ubuntu Update Manager ${PROGRAM_VERSION} is up to date."
+    else
+        info "Installed version ${PROGRAM_VERSION} is newer than public version ${latest}."
+    fi
+}
+
+install_latest_manager() (
+    require_root
+    ensure_installed
+
+    local candidate latest candidate_version installed_temp=""
+    candidate="$(mktemp)"
+    trap 'rm -f -- "$candidate"; [[ -z "$installed_temp" ]] || rm -f -- "$installed_temp"' EXIT
+
+    download_update_source "$candidate" || return 1
+    latest="$(script_version "$candidate")" || {
+        warn "The public update source did not contain one valid version declaration."
+        return 1
+    }
+    validate_update_candidate "$candidate" "$latest" || {
+        warn "The downloaded update failed validation and was not installed."
+        return 1
+    }
+
+    if ! version_is_newer "$latest" "$PROGRAM_VERSION"; then
+        if [[ "$latest" == "$PROGRAM_VERSION" ]]; then
+            info "Ubuntu Update Manager ${PROGRAM_VERSION} is already up to date."
+        else
+            info "Installed version ${PROGRAM_VERSION} is newer than public version ${latest}."
+        fi
+        return 2
+    fi
+
+    [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] || {
+        warn "Refusing to update a missing, non-regular, or symbolic ${INSTALL_PATH}."
+        return 1
+    }
+    candidate_version="$(script_version "$candidate")"
+    installed_temp="$(mktemp "${INSTALL_PATH}.update.XXXXXX")"
+    install -o root -g root -m 0750 "$candidate" "$installed_temp"
+    mv -f -- "$installed_temp" "$INSTALL_PATH"
+    installed_temp=""
+    info "Updated Ubuntu Update Manager from ${PROGRAM_VERSION} to ${candidate_version}."
+    info "The new manager version will be used on the next invocation."
+)
+
+self_update_manager() (
+    require_root
+    ensure_installed
+
+    local result
+    install -d -o root -g root -m 0755 "$(dirname "$LOCK_PATH")"
+    exec 8>"$LOCK_PATH"
+    flock -n 8 || {
+        warn "An update run or uninstall is in progress; the manager was not updated."
+        return 1
+    }
+
+    install_latest_manager && return 0
+    result="$?"
+    (( result == 2 )) && return 0
+    return "$result"
+)
+
+self_update_enabled_for_run() {
+    local scheduled="$1"
+
+    case "${SELF_UPDATE_MODE}:${scheduled}" in
+        both:*|manual:no|scheduled:yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+maybe_self_update() {
+    local scheduled="$1"
+    local result
+
+    self_update_enabled_for_run "$scheduled" || return 0
+    info "Checking for an Ubuntu Update Manager update..."
+    install_latest_manager && return 0
+    result="$?"
+    if (( result != 2 )); then
+        warn "The manager could not self-update; continuing with Ubuntu package updates."
+    fi
+    return 0
+}
+
+interactive_update_prompt() {
+    local latest answer result
+
+    info "Checking the public repository for manager updates..."
+    latest="$(latest_public_version)" || {
+        warn "The update check could not be completed."
+        return 0
+    }
+    if ! version_is_newer "$latest" "$PROGRAM_VERSION"; then
+        if [[ "$latest" == "$PROGRAM_VERSION" ]]; then
+            info "Ubuntu Update Manager ${PROGRAM_VERSION} is up to date."
+        else
+            info "Installed version ${PROGRAM_VERSION} is newer than public version ${latest}."
+        fi
+        return 0
+    fi
+
+    info "Ubuntu Update Manager ${latest} is available (installed: ${PROGRAM_VERSION})."
+    read -r -p "Install the manager update now? [y/N] " answer
+    [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]] || return 0
+
+    self_update_manager && exec "$INSTALL_PATH" menu
+    result="$?"
+    if (( result != 2 )); then
+        warn "The manager update was not installed."
+    fi
+}
+
 install_manager() {
     require_root
     local preserving_config="no"
@@ -717,8 +1074,12 @@ install_manager() {
         set_config_defaults
     fi
 
+    check_required_utilities
+    check_short_command_destination
+
     ensure_cron_service
     install_program_file
+    install_short_command
     write_config
     if [[ "$preserving_config" == "yes" ]]; then
         info "Preserving the existing configuration."
@@ -734,7 +1095,7 @@ install_manager() {
     info "Ubuntu Update Manager ${PROGRAM_VERSION} is installed."
     show_status
     info
-    info "Run '${PROGRAM_NAME} menu' for interactive management."
+    info "Run '${SHORT_COMMAND} menu' for interactive management."
 }
 
 enable_updates() {
@@ -783,10 +1144,13 @@ show_status() {
 
     info "Ubuntu Update Manager ${PROGRAM_VERSION}"
     info "Installed:       $([[ -x "$INSTALL_PATH" ]] && printf 'yes' || printf 'no')"
+    info "Short command:   $(if short_command_installed; then printf 'yes (%s)' "$SHORT_INSTALL_PATH"; else printf 'no'; fi)"
     info "Enabled:         ${ENABLED}"
     show_schedule
     info "Cron expression: ${CRON_EXPRESSION}"
     info "Update mode:     ${UPDATE_MODE}"
+    info "APT lock wait:   ${APT_LOCK_TIMEOUT}s"
+    info "Manager self-update: ${SELF_UPDATE_MODE}"
     info "Snap updates:    ${INCLUDE_SNAPS}"
     info "Automatic reboot: ${AUTO_REBOOT}"
     info "Failure email:   ${NOTIFY_EMAIL:-disabled}"
@@ -804,7 +1168,7 @@ show_status() {
         [[ "$(ps -p 1 -o comm= 2>/dev/null)" == "systemd" ]]; then
         if systemctl is-active --quiet apt-daily.timer 2>/dev/null ||
             systemctl is-active --quiet apt-daily-upgrade.timer 2>/dev/null; then
-            warn "Ubuntu APT background timers are active; update runs will wait up to 5 minutes for APT locks."
+            warn "Ubuntu APT background timers are active; update runs will wait up to ${APT_LOCK_TIMEOUT} seconds for APT locks."
         fi
         if systemctl is-enabled --quiet unattended-upgrades.service 2>/dev/null; then
             warn "unattended-upgrades is enabled; review both policies to avoid overlapping update behavior."
@@ -817,6 +1181,154 @@ show_status() {
 
     if [[ -f /var/run/reboot-required ]]; then
         warn "The server currently requires a reboot."
+    fi
+}
+
+doctor_installation() {
+    require_root
+
+    local errors=0 warnings=0 index owner mode config_error
+    local -a missing=()
+    local -a paths=(
+        "$INSTALL_PATH" "$CONFIG_PATH" "$CRON_PATH" "$LOGROTATE_PATH"
+    )
+    local -a labels=(
+        "Installed executable" "Configuration" "Cron definition" "Logrotate definition"
+    )
+    local -a modes=(750 644 644 644)
+
+    info "Ubuntu Update Manager doctor"
+    mapfile -t missing < <(missing_required_utilities)
+    if (( ${#missing[@]} > 0 )); then
+        warn "FAIL: Missing required base utilities: ${missing[*]}"
+        info "Doctor result: failed (1 error, 0 warnings)"
+        return 1
+    fi
+    info "PASS: Required base utilities are available."
+
+    if short_command_installed; then
+        info "PASS: Short command ${SHORT_INSTALL_PATH} points to the installed manager."
+    else
+        warn "FAIL: Short command ${SHORT_INSTALL_PATH} is missing or points elsewhere."
+        ((errors += 1))
+    fi
+
+    for index in "${!paths[@]}"; do
+        if [[ ! -f "${paths[$index]}" || -L "${paths[$index]}" ]]; then
+            warn "FAIL: ${labels[$index]} is missing or is not a regular file: ${paths[$index]}"
+            ((errors += 1))
+            continue
+        fi
+
+        owner="$(stat -c '%u' "${paths[$index]}")"
+        mode="$(stat -c '%a' "${paths[$index]}")"
+        if [[ "$owner" != "0" || "$mode" != "${modes[$index]}" ]]; then
+            warn "FAIL: ${labels[$index]} must be root-owned with mode ${modes[$index]} (found owner ${owner}, mode ${mode})."
+            ((errors += 1))
+        else
+            info "PASS: ${labels[$index]} ownership and permissions are correct."
+        fi
+    done
+
+    if config_error="$(load_config 2>&1)"; then
+        info "PASS: Configuration values and cron expression are valid."
+        load_config
+    else
+        warn "FAIL: Configuration validation failed: ${config_error}"
+        ((errors += 1))
+    fi
+
+    if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+        info "PASS: Manager update checks have curl or wget available."
+    elif [[ "$SELF_UPDATE_MODE" == "off" ]]; then
+        warn "WARN: Manager update checks require curl or wget."
+        ((warnings += 1))
+    else
+        warn "FAIL: Automatic manager updates require curl or wget."
+        ((errors += 1))
+    fi
+
+    if cron_service_active; then
+        info "PASS: Cron service is active."
+    else
+        warn "FAIL: Cron service is not active."
+        ((errors += 1))
+    fi
+
+    if [[ -n "$NOTIFY_EMAIL" ]]; then
+        if [[ -x /usr/sbin/sendmail ]]; then
+            info "PASS: Failure email has a sendmail-compatible delivery command."
+        else
+            warn "WARN: Failure email is configured, but /usr/sbin/sendmail is unavailable."
+            ((warnings += 1))
+        fi
+    else
+        info "PASS: Failure email is disabled; no mail delivery dependency is required."
+    fi
+
+    if [[ "$AUTO_REBOOT" == "yes" ]] &&
+        ! command -v shutdown >/dev/null 2>&1; then
+        warn "FAIL: Automatic rebooting is enabled, but shutdown is unavailable."
+        ((errors += 1))
+    fi
+
+    if [[ "$INCLUDE_SNAPS" == "yes" ]] &&
+        ! command -v snap >/dev/null 2>&1; then
+        warn "WARN: Snap updates are enabled, but Snap is not installed; Snap refreshes will be skipped."
+        ((warnings += 1))
+    fi
+
+    if (( errors > 0 )); then
+        info "Doctor result: failed (${errors} error(s), ${warnings} warning(s))"
+        return 1
+    fi
+
+    info "Doctor result: healthy (${warnings} warning(s))"
+}
+
+export_config() {
+    ensure_installed
+    load_config
+
+    printf 'ENABLED=%s\n' "$ENABLED"
+    printf 'FREQUENCY=%s\n' "$FREQUENCY"
+    printf 'RUN_TIME=%s\n' "$RUN_TIME"
+    printf 'RUN_DAY=%s\n' "$RUN_DAY"
+    printf 'CRON_EXPRESSION=%s\n' "$CRON_EXPRESSION"
+    printf 'UPDATE_MODE=%s\n' "$UPDATE_MODE"
+    printf 'AUTO_REBOOT=%s\n' "$AUTO_REBOOT"
+    printf 'INCLUDE_SNAPS=%s\n' "$INCLUDE_SNAPS"
+    printf 'NOTIFY_EMAIL=%s\n' "$NOTIFY_EMAIL"
+    printf 'APT_LOCK_TIMEOUT=%s\n' "$APT_LOCK_TIMEOUT"
+    printf 'SELF_UPDATE_MODE=%s\n' "$SELF_UPDATE_MODE"
+}
+
+preview_updates() {
+    require_root
+    ensure_installed
+    load_config
+    check_required_utilities
+
+    info "APT update preview (using the currently cached package lists):"
+    case "$UPDATE_MODE" in
+        safe)
+            apt-get --simulate --with-new-pkgs \
+                -o Debug::NoLocking=true upgrade
+            ;;
+        full)
+            apt-get --simulate \
+                -o Debug::NoLocking=true full-upgrade
+            ;;
+    esac
+
+    if [[ "$INCLUDE_SNAPS" == "yes" ]]; then
+        info
+        info "Snap update preview:"
+        if command -v snap >/dev/null 2>&1; then
+            snap refresh --list
+        else
+            info "Snap is not installed; Snap refreshes would be skipped."
+        fi
     fi
 }
 
@@ -963,11 +1475,46 @@ set_email() {
     fi
 }
 
+set_lock_timeout() {
+    require_root
+    ensure_installed
+    load_config
+
+    local value="${1:-}"
+    if [[ ! "$value" =~ ^[0-9]+$ ]] ||
+        (( ${#value} > 4 || 10#$value > 3600 )); then
+        die "APT lock timeout must be a number from 0 through 3600."
+    fi
+
+    APT_LOCK_TIMEOUT="$((10#$value))"
+    write_config
+    info "APT lock timeout: ${APT_LOCK_TIMEOUT} seconds"
+}
+
+set_self_update_mode() {
+    require_root
+    ensure_installed
+    load_config
+
+    case "${1:-}" in
+        off|manual|scheduled|both)
+            SELF_UPDATE_MODE="$1"
+            ;;
+        *)
+            die "Manager self-update mode must be off, manual, scheduled, or both."
+            ;;
+    esac
+
+    write_config
+    info "Manager self-update mode: ${SELF_UPDATE_MODE}"
+}
+
 send_failure_notification() {
     local exit_code="$1"
     local line_number="$2"
     local started_at="$3"
     local finished_at="$4"
+    local failed_phase="$5"
     local host
 
     [[ -n "$NOTIFY_EMAIL" ]] || return 0
@@ -987,6 +1534,7 @@ send_failure_notification() {
         printf 'Started: %s\n' "$started_at"
         printf 'Finished: %s\n' "$finished_at"
         printf 'Exit code: %s\n' "$exit_code"
+        printf 'Failed phase: %s\n' "$failed_phase"
         printf 'Approximate script line: %s\n' "$line_number"
         printf 'Log: %s\n\n' "$LOG_PATH"
         printf 'Last 80 log lines:\n'
@@ -999,6 +1547,9 @@ update_failed() {
     local line_number="$2"
     local start_epoch="$3"
     local started_at="$4"
+    local failed_phase="$5"
+    local reboot_required="$6"
+    local reboot_scheduled="$7"
     local finish_epoch finished_at duration
 
     trap - ERR
@@ -1007,13 +1558,14 @@ update_failed() {
     finished_at="$(date --iso-8601=seconds)"
     duration="$((finish_epoch - start_epoch))"
     write_run_state \
-        "failure" "$exit_code" "$started_at" "$finished_at" "$duration"
+        "failure" "$exit_code" "$started_at" "$finished_at" "$duration" \
+        "$failed_phase" "$reboot_required" "$reboot_scheduled"
     logger -t "$PROGRAM_NAME" \
-        "Update run failed with exit code ${exit_code} near line ${line_number}."
-    info "Ubuntu update failed with exit code ${exit_code}."
+        "Update phase '${failed_phase}' failed with exit code ${exit_code} near line ${line_number}."
+    info "Ubuntu update failed during phase: ${failed_phase} (exit ${exit_code})."
     info "Review ${LOG_PATH} for details."
     send_failure_notification \
-        "$exit_code" "$line_number" "$started_at" "$finished_at"
+        "$exit_code" "$line_number" "$started_at" "$finished_at" "$failed_phase"
     exit "$exit_code"
 }
 
@@ -1021,6 +1573,11 @@ perform_updates() (
     require_root
     ensure_installed
     load_config
+    check_required_utilities
+
+    UPDATE_PHASE="initialization"
+    REBOOT_REQUIRED="unknown"
+    REBOOT_SCHEDULED="no"
 
     local scheduled="${1:-no}"
     local start_epoch started_at finish_epoch finished_at duration
@@ -1039,7 +1596,7 @@ perform_updates() (
     exec > >(tee -a "$LOG_PATH") 2>&1
     start_epoch="$(date +%s)"
     started_at="$(date --iso-8601=seconds)"
-    trap 'update_failed "$?" "$LINENO" "$start_epoch" "$started_at"' ERR
+    trap 'update_failed "$?" "$LINENO" "$start_epoch" "$started_at" "$UPDATE_PHASE" "$REBOOT_REQUIRED" "$REBOOT_SCHEDULED"' ERR
 
     info
     info "============================================================"
@@ -1047,29 +1604,35 @@ perform_updates() (
     info "Mode: ${UPDATE_MODE}; Snap updates: ${INCLUDE_SNAPS}"
     info "============================================================"
 
+    UPDATE_PHASE="manager self-update"
+    maybe_self_update "$scheduled"
+
     export DEBIAN_FRONTEND=noninteractive
     export NEEDRESTART_MODE=a
 
+    UPDATE_PHASE="APT repository refresh"
     apt-get \
-        -o DPkg::Lock::Timeout=300 \
+        -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" \
         -o Acquire::Retries=3 \
         -o APT::Update::Error-Mode=any \
         update
 
     case "$UPDATE_MODE" in
         safe)
+            UPDATE_PHASE="APT safe upgrade"
             apt-get \
                 -y \
                 --with-new-pkgs \
-                -o DPkg::Lock::Timeout=300 \
+                -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" \
                 -o Acquire::Retries=3 \
                 -o Dpkg::Options::="--force-confold" \
                 upgrade
             ;;
         full)
+            UPDATE_PHASE="APT full upgrade"
             apt-get \
                 -y \
-                -o DPkg::Lock::Timeout=300 \
+                -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" \
                 -o Acquire::Retries=3 \
                 -o Dpkg::Options::="--force-confold" \
                 full-upgrade
@@ -1079,38 +1642,48 @@ perform_updates() (
             ;;
     esac
 
+    UPDATE_PHASE="APT cache cleanup"
     apt-get \
         -y \
-        -o DPkg::Lock::Timeout=300 \
+        -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" \
         -o Acquire::Retries=3 \
         autoclean
 
     if [[ "$INCLUDE_SNAPS" == "yes" ]] && command -v snap >/dev/null 2>&1; then
+        UPDATE_PHASE="Snap refresh"
         snap refresh
     fi
 
+    UPDATE_PHASE="reboot evaluation"
     if [[ -f /var/run/reboot-required ]]; then
+        REBOOT_REQUIRED="yes"
         logger -t "$PROGRAM_NAME" "Updates installed; reboot required."
         info "A reboot is required to finish installing updates."
 
         if [[ "$AUTO_REBOOT" == "yes" && "$scheduled" == "yes" ]]; then
             info "The server will reboot in one minute."
+            UPDATE_PHASE="automatic reboot scheduling"
             shutdown -r +1 "Rebooting after scheduled Ubuntu updates"
+            REBOOT_SCHEDULED="yes"
         elif [[ "$AUTO_REBOOT" == "yes" ]]; then
             info "Automatic reboot applies only to scheduled runs; this manual run will not reboot the server."
         else
             info "Automatic rebooting is disabled."
         fi
     else
+        REBOOT_REQUIRED="no"
         logger -t "$PROGRAM_NAME" "Updates installed successfully."
         info "No reboot is currently required."
     fi
 
+    UPDATE_PHASE="run finalization"
     finish_epoch="$(date +%s)"
     finished_at="$(date --iso-8601=seconds)"
     duration="$((finish_epoch - start_epoch))"
+    UPDATE_PHASE="run-state recording"
     write_run_state \
-        "success" "0" "$started_at" "$finished_at" "$duration"
+        "success" "0" "$started_at" "$finished_at" "$duration" \
+        "" "$REBOOT_REQUIRED" "$REBOOT_SCHEDULED"
     info "Ubuntu update finished: ${finished_at} (${duration}s)"
     trap - ERR
 )
@@ -1151,6 +1724,12 @@ uninstall_manager() (
     rm -f "$LOGROTATE_PATH"
     rm -f "$STATE_PATH"
     rmdir "$STATE_DIR" 2>/dev/null || true
+
+    if short_command_installed; then
+        rm -f "$SHORT_INSTALL_PATH"
+    elif [[ -e "$SHORT_INSTALL_PATH" || -L "$SHORT_INSTALL_PATH" ]]; then
+        warn "Retaining unrelated path ${SHORT_INSTALL_PATH}."
+    fi
 
     if [[ "$SCRIPT_PATH" == "$INSTALL_PATH" ]]; then
         rm -f "$INSTALL_PATH"
@@ -1210,6 +1789,7 @@ EOF
 interactive_menu() {
     require_root
     ensure_installed
+    interactive_update_prompt
 
     local choice
     while true; do
@@ -1227,6 +1807,7 @@ Ubuntu Update Manager
   8) Toggle Snap updates
   9) View update log
   10) Configure failure email
+  11) Configure manager self-updates
   0) Exit
 EOF
         read -r -p "Choice: " choice
@@ -1272,6 +1853,10 @@ EOF
                 read -r -p "Failure email address or off [${NOTIFY_EMAIL:-off}]: " choice
                 set_email "${choice:-${NOTIFY_EMAIL:-off}}"
                 ;;
+            11)
+                read -r -p "Self-update mode (off, manual, scheduled, both) [${SELF_UPDATE_MODE}]: " choice
+                set_self_update_mode "${choice:-$SELF_UPDATE_MODE}"
+                ;;
             0)
                 return
                 ;;
@@ -1299,6 +1884,21 @@ main() {
         status)
             show_status
             ;;
+        preview|dry-run)
+            preview_updates
+            ;;
+        doctor|check)
+            doctor_installation
+            ;;
+        export-config)
+            export_config
+            ;;
+        check-update)
+            check_for_manager_update
+            ;;
+        self-update)
+            self_update_manager
+            ;;
         run)
             if [[ "${1:-}" == "--scheduled" ]]; then
                 perform_updates yes
@@ -1323,6 +1923,12 @@ main() {
             ;;
         set-email)
             set_email "${1:-}"
+            ;;
+        set-lock-timeout)
+            set_lock_timeout "${1:-}"
+            ;;
+        set-self-update)
+            set_self_update_mode "${1:-}"
             ;;
         logs)
             show_logs "${1:-100}"
@@ -1353,4 +1959,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -7,9 +7,10 @@ defaults take priority over adding a large number of features.
 No dates in this roadmap are commitments. Priorities may change as the script
 is used across more Ubuntu releases and server configurations.
 
-## Current Release: 1.1
+## Current Release: 1.1.1
 
-Version 1.1 provides the hardened cron-based foundation:
+Version 1.1.1 provides the hardened cron-based foundation plus the first set of
+low-risk reliability and compatibility improvements:
 
 - Strict, non-executable configuration parsing
 - Validated daily, weekly, monthly, and custom schedules
@@ -21,26 +22,23 @@ Version 1.1 provides the hardened cron-based foundation:
 - Rotated logs and persistent run status
 - Optional local email notification on failure
 - Detection of common APT scheduling conflicts
+- Required base-utility checks before installation and update execution
+- Exact failed-phase reporting
+- Last-run reboot-required and reboot-scheduled state
+- Read-only `doctor`, `preview`, and `export-config` commands
+- Public-repository update checks and opt-in atomic manager self-updates
+- Short `uum` command with collision-aware installation and removal
+- Configurable APT lock timeout with a 300-second default
+- Automated Bash syntax, ShellCheck, and CLI smoke checks
+- Published support, compatibility, contribution, and security policies
 
-## 1.1.x: Reliability and Compatibility
+## Remaining 1.1.x Work
 
-The next maintenance releases will focus on low-risk improvements to the
-existing architecture.
+The remaining maintenance work requires broader test environments:
 
-- Add automated ShellCheck and Bash syntax checks.
 - Add repeatable integration tests using disposable Ubuntu containers or
   virtual machines.
 - Test supported behavior on active Ubuntu LTS releases.
-- Add explicit checks for all required base utilities before installation.
-- Improve failure summaries with the exact failed update phase.
-- Record whether a reboot was required or scheduled during the last run.
-- Add a `check` or `doctor` command that validates installation permissions,
-  configuration, cron parsing, mail delivery prerequisites, and service state
-  without installing updates.
-- Add a dry-run or update-preview command that reports pending APT and Snap
-  updates without changing the system.
-- Add a noninteractive configuration export suitable for backups and audits.
-- Add a configurable APT lock timeout while retaining a conservative default.
 
 ## 1.2: Persistent systemd Scheduling
 
@@ -108,13 +106,8 @@ local updater into a privileged network daemon.
 
 ## Documentation and Release Engineering
 
-These tasks apply across all planned releases:
+Remaining release-engineering tasks apply across all planned releases:
 
-- Publish an explicit support policy for Ubuntu versions.
-- Maintain upgrade notes and backward-compatibility guarantees.
-- Add a security policy and responsible disclosure instructions.
-- Add a license and contribution guidelines before accepting public
-  contributions.
 - Add changelog release links when a canonical repository is established.
 - Attach checksums and signed provenance to published releases.
 
