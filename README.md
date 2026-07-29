@@ -50,7 +50,27 @@ sendmail-compatible local mail service.
 
 ## Install or Upgrade
 
-Download `ubuntu-update-manager.sh`, then run:
+Download the v1.1.1 release asset directly with `curl`:
+
+```bash
+curl -fL -o ubuntu-update-manager.sh \
+  https://github.com/SmoothBrainIT/ubuntu-update-manager/releases/download/v1.1.1/ubuntu-update-manager.sh
+```
+
+Or use `wget`:
+
+```bash
+wget https://github.com/SmoothBrainIT/ubuntu-update-manager/releases/download/v1.1.1/ubuntu-update-manager.sh
+```
+
+Verify the downloaded file:
+
+```bash
+echo "3eab50d4d3496e3c60543add29621bf89b060b9d3175f1c8a49eb956e3357062  ubuntu-update-manager.sh" \
+  | sha256sum --check
+```
+
+Install or upgrade the manager:
 
 ```bash
 sudo bash ubuntu-update-manager.sh install
